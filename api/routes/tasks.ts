@@ -14,6 +14,7 @@ import type {
   FileInfo,
   BoundaryConditions,
   RockMechanicsParams,
+  Fault,
 } from '../../shared/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -38,7 +39,23 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
     pageSize: Number(req.query.pageSize ?? 20),
   };
   const data: PaginatedResponse<SimulationTask> = TaskService.list(query);
-  const body: ApiResponse<PaginatedResponse<SimulationTask>> = { success: true, data };
+  const filteredData = data.data.filter((task) => {
+    const fault = db.getById('faults', task.faultId) as Fault | undefined;
+    return !fault?.isPaused;
+  });
+  const filteredTotal = filteredData.length;
+  const page = query.page;
+  const pageSize = query.pageSize;
+  const start = (page - 1) * pageSize;
+  const body: ApiResponse<PaginatedResponse<SimulationTask>> = {
+    success: true,
+    data: {
+      data: filteredData.slice(start, start + pageSize),
+      total: filteredTotal,
+      page,
+      pageSize,
+    },
+  };
   res.status(200).json(body);
 });
 
@@ -65,6 +82,14 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
   };
   if (!params.name || !params.faultId) {
     res.status(400).json({ success: false, error: '缺少必填字段' });
+    return;
+  }
+  const fault = db.getById('faults', params.faultId) as Fault | undefined;
+  if (fault?.isPaused) {
+    res.status(400).json({
+      success: false,
+      error: `该断层[${fault.name}]已暂停，连续3次滑动量偏差超20%，请联系首席科学家解除后再创建任务`,
+    });
     return;
   }
   const geometryFile: FileInfo = params.geometryFile ?? {

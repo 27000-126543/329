@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { db } from '../db/store.js';
-import type { ApiResponse, SimulationReport } from '../../shared/types.js';
+import type { ApiResponse, SimulationReport, SimulationTask } from '../../shared/types.js';
+import PDFDocument from 'pdfkit';
 
 const router = Router();
 
@@ -29,39 +30,146 @@ router.get('/:taskId', async (req: Request, res: Response): Promise<void> => {
   res.status(200).json(body);
 });
 
+interface ExportRequest {
+  format?: 'json' | 'csv';
+  segmentIds?: string[];
+  stressSource?: 'principal' | 'shear' | 'coulomb';
+  timeWindow?: { startStep: number; endStep: number };
+}
+
+type FilteredStressFieldPoint = Pick<StressFieldPoint, 'x' | 'y' | 'z'> &
+  Partial<Pick<StressFieldPoint, 's1' | 's2' | 's3' | 'shear' | 'coulomb'>>;
+
 router.post('/:taskId/export', async (req: Request, res: Response): Promise<void> => {
-  const format = (req.body.format ?? req.query.format ?? 'json') as 'json' | 'csv';
+  const { format, segmentIds, stressSource, timeWindow }: ExportRequest = req.body;
+  const finalFormat = (format ?? req.query.format ?? 'json') as 'json' | 'csv';
   const report = db.getById('reports', req.params.taskId) as SimulationReport | undefined;
   if (!report) {
     res.status(404).json({ success: false, error: '报告不存在' });
     return;
   }
-  if (format === 'csv') {
-    const header = ['distanceAlongFault,slipAmount,slipPotential,segmentId'];
-    const rows = report.slipDistribution.map(
-      (p) => `${p.distanceAlongFault},${p.slipAmount},${p.slipPotential},${p.segmentId}`,
-    );
-    const csv = [...header, ...rows].join('\n');
+
+  const filteredSlip = segmentIds && segmentIds.length > 0
+    ? report.slipDistribution.filter((p) => segmentIds.includes(p.segmentId))
+    : report.slipDistribution;
+
+  const filteredMoments = timeWindow
+    ? report.seismicMomentCurve.filter(
+        (p) => p.timeStep >= timeWindow.startStep && p.timeStep <= timeWindow.endStep,
+      )
+    : report.seismicMomentCurve;
+
+  const stressFieldKeys: (keyof Pick<StressFieldPoint, 's1' | 's2' | 's3' | 'shear' | 'coulomb'>)[] =
+    stressSource === 'principal'
+      ? ['s1', 's2', 's3']
+      : stressSource === 'shear'
+        ? ['shear']
+        : stressSource === 'coulomb'
+          ? ['coulomb']
+          : ['s1', 's2', 's3', 'shear', 'coulomb'];
+
+  const filteredStressField: FilteredStressFieldPoint[] = report.stressFieldData.map((p) => {
+    const result: FilteredStressFieldPoint = { x: p.x, y: p.y, z: p.z };
+    for (const k of stressFieldKeys) {
+      (result as any)[k] = p[k];
+    }
+    return result;
+  });
+
+  const exportParams = {
+    segmentIds: segmentIds ?? null,
+    stressSource: stressSource ?? null,
+    timeWindow: timeWindow ?? null,
+  };
+
+  if (finalFormat === 'csv') {
+    const lines: string[] = [];
+
+    lines.push('=== Stress Tensor Field ===');
+    const stressHeader = ['x', 'y', 'z', ...stressFieldKeys].join(',');
+    lines.push(stressHeader);
+    for (const p of report.stressFieldData) {
+      const row = [String(p.x), String(p.y), String(p.z), ...stressFieldKeys.map((k) => String(p[k]))];
+      lines.push(row.join(','));
+    }
+
+    lines.push('');
+    lines.push('=== Fault Slip Distribution ===');
+    lines.push('distanceAlongFault,slipAmount,slipPotential,segmentId');
+    for (const p of filteredSlip) {
+      lines.push(`${p.distanceAlongFault},${p.slipAmount},${p.slipPotential},${p.segmentId}`);
+    }
+
+    if (timeWindow) {
+      lines.push('');
+      lines.push('=== Seismic Moment (filtered) ===');
+      lines.push('timeStep,momentRate,cumulativeMoment');
+      for (const p of filteredMoments) {
+        lines.push(`${p.timeStep},${p.momentRate},${p.cumulativeMoment}`);
+      }
+    }
+
+    const csv = lines.join('\n');
+    const filenameParts = [`report-task-${req.params.taskId}`];
+    if (segmentIds && segmentIds.length > 0) {
+      const segShort = segmentIds.map((s) => s.replace(/^seg-/, '')).join('-');
+      filenameParts.push(`seg${segShort}`);
+    }
+    if (stressSource) {
+      filenameParts.push(stressSource);
+    }
+    if (timeWindow) {
+      filenameParts.push(`t${timeWindow.startStep}-${timeWindow.endStep}`);
+    }
+    const filename = filenameParts.join('-') + '.csv';
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="report-${req.params.taskId}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.status(200).send(csv);
     return;
   }
-  const body: ApiResponse<SimulationReport> = { success: true, data: report };
+
+  const exportData = {
+    taskId: req.params.taskId,
+    exportParams,
+    stressField: filteredStressField,
+    slipDistribution: filteredSlip,
+    seismicMomentCurve: timeWindow ? filteredMoments : report.seismicMomentCurve,
+  };
+  const body: ApiResponse<typeof exportData> = { success: true, data: exportData };
   res.status(200).json(body);
 });
 
 router.get('/:taskId/pdf', async (req: Request, res: Response): Promise<void> => {
-  const report = db.getById('reports', req.params.taskId);
-  if (!report) {
-    res.status(404).json({ success: false, error: '报告不存在' });
+  const taskId = req.params.taskId;
+  const task = db.getById('tasks', taskId) as SimulationTask | undefined;
+  if (!task) {
+    res.status(404).json({ success: false, error: '任务不存在' });
     return;
   }
-  res.status(200).json({
-    success: true,
-    message: 'PDF生成接口（前端集成jsPDF实现）',
-    data: { reportId: req.params.taskId, summary: (report as SimulationReport).summary },
-  });
+  let report = db.getById('reports', taskId) as SimulationReport | undefined;
+  if (!report) {
+    if (
+      ['completed', 'postdoc_approved', 'professor_approved', 'published'].includes(task.status)
+    ) {
+      report = generateReportData(task);
+      db.insert('reports', task.id, report);
+    } else {
+      res.status(400).json({ success: false, error: '任务尚未完成，报告暂不可用' });
+      return;
+    }
+  }
+  try {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="report-${taskId}.pdf"`,
+    );
+    const doc = createPdfReport(task, report);
+    doc.pipe(res);
+  } catch (err) {
+    console.error('PDF生成失败:', err);
+    res.status(500).json({ success: false, error: 'PDF生成失败' });
+  }
 });
 
 function rand(min: number, max: number): number {

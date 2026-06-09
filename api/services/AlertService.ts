@@ -18,6 +18,30 @@ function rand(min: number, max: number): number {
   return Math.random() * (max - min) + min;
 }
 
+function stdDev(values: number[]): number {
+  if (values.length === 0) return 0;
+  const n = values.length;
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const squaredDiffs = values.map((v) => Math.pow(v - mean, 2));
+  return Math.sqrt(squaredDiffs.reduce((a, b) => a + b, 0) / n);
+}
+
+function isDuplicateAlert(
+  existingAlerts: Alert[],
+  taskId: string,
+  type: Alert['type'],
+  affectedRegion: string,
+): boolean {
+  const now = Date.now();
+  const thirtyMinutesMs = 30 * 60 * 1000;
+  return existingAlerts.some((a) => {
+    if (a.taskId !== taskId || a.type !== type || a.affectedRegion !== affectedRegion) return false;
+    if (a.status !== 'pending' && a.status !== 'reviewed') return false;
+    const triggeredTime = new Date(a.triggeredAt).getTime();
+    return now - triggeredTime < thirtyMinutesMs;
+  });
+}
+
 interface AlertCheckContext {
   maxShearThreshold?: number;
   slipRateThreshold?: number;
@@ -98,9 +122,9 @@ export class AlertService {
   static checkAndTrigger(
     taskId: string,
     ctx: AlertCheckContext = {},
-  ): Alert | null {
+  ): Alert[] {
     const task = db.getById('tasks', taskId);
-    if (!task) return null;
+    if (!task) return [];
     const monitorPts = db.getMonitorPoints(taskId);
     const latest = monitorPts[monitorPts.length - 1] ?? this.syntheticPoint(task);
     const candidates: Array<{
@@ -130,20 +154,37 @@ export class AlertService {
         desc: '滑动速率异常升高，建议复核孔隙压力',
       });
     }
-    if (monitorPts.length > 5 && Math.random() < 0.2) {
+    if (monitorPts.length > 5) {
       const convTh = ctx.convergenceThreshold ?? 0.001;
-      const conv = rand(0.0008, 0.002);
-      candidates.push({
-        type: 'convergence_warning',
-        threshold: convTh,
-        actual: +conv.toFixed(6),
-        region: this.pickRegion(task),
-        desc: '残差收敛速度下降，迭代步数超出上限',
-      });
+      const last5 = monitorPts.slice(-5);
+      const changeRates: number[] = [];
+      for (let i = 1; i < last5.length; i++) {
+        const prev = last5[i - 1].maxShearStress;
+        const curr = last5[i].maxShearStress;
+        if (Math.abs(prev) > 1e-9) {
+          changeRates.push(Math.abs((curr - prev) / prev));
+        }
+      }
+      const conv = stdDev(changeRates);
+      if (conv > convTh) {
+        candidates.push({
+          type: 'convergence_warning',
+          threshold: convTh,
+          actual: +conv.toFixed(6),
+          region: this.pickRegion(task),
+          desc: '残差收敛速度下降，迭代步数超出上限',
+        });
+      }
     }
-    if (candidates.length === 0) return null;
-    const picked = candidates[Math.floor(Math.random() * candidates.length)];
-    return this.createAlert(task, picked.type, picked.threshold, picked.actual, picked.region, picked.desc);
+    if (candidates.length === 0) return [];
+    const existingAlerts = db.getAll('alerts');
+    const results: Alert[] = [];
+    for (const c of candidates) {
+      if (isDuplicateAlert(existingAlerts, taskId, c.type, c.region)) continue;
+      const alert = this.createAlert(task, c.type, c.threshold, c.actual, c.region, c.desc);
+      results.push(alert);
+    }
+    return results;
   }
 
   private static syntheticPoint(task: SimulationTask): MonitorDataPoint {
