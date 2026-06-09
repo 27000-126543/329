@@ -34,16 +34,34 @@ function isDuplicateAlert(
   existingAlerts: Alert[],
   taskId: string,
   type: Alert['type'],
-  affectedRegion: string,
 ): boolean {
   const now = Date.now();
   const thirtyMinutesMs = 30 * 60 * 1000;
   return existingAlerts.some((a) => {
-    if (a.taskId !== taskId || a.type !== type || a.affectedRegion !== affectedRegion) return false;
+    if (a.taskId !== taskId || a.type !== type) return false;
     if (a.status !== 'pending' && a.status !== 'reviewed') return false;
     const triggeredTime = new Date(a.triggeredAt).getTime();
     return now - triggeredTime < thirtyMinutesMs;
   });
+}
+
+function countContinuousAbove(values: number[], threshold: number): number {
+  let streak = 0;
+  let maxStreak = 0;
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (values[i] > threshold) {
+      streak++;
+      if (streak > maxStreak) maxStreak = streak;
+    } else {
+      break;
+    }
+  }
+  return maxStreak;
+}
+
+function countAboveRatio(values: number[], threshold: number): number {
+  if (values.length === 0) return 0;
+  return values.filter((v) => v > threshold).length / values.length;
 }
 
 interface AlertCheckContext {
@@ -173,7 +191,12 @@ export class AlertService {
     const task = db.getById('tasks', taskId);
     if (!task) return [];
     const monitorPts = db.getMonitorPoints(taskId);
-    const latest = monitorPts[monitorPts.length - 1] ?? this.syntheticPoint(task);
+    if (monitorPts.length === 0) {
+      const syn = this.syntheticPoint(task);
+      monitorPts.push(syn);
+      db.appendMonitorPoints(taskId, [syn]);
+    }
+    const latest = monitorPts[monitorPts.length - 1];
     const candidates: Array<{
       type: Alert['type'];
       threshold: number;
@@ -181,26 +204,37 @@ export class AlertService {
       region: string;
       desc: string;
     }> = [];
-    const maxShearTh = ctx.maxShearThreshold ?? 45;
-    if (latest.maxShearStress > maxShearTh) {
+
+    const frictionTh = +(latest.frictionStrength || task.rockParams.cohesion + task.rockParams.frictionCoefficient * 30).toFixed(2);
+    if (latest.maxShearStress > frictionTh) {
+      const over = +(latest.maxShearStress - frictionTh).toFixed(2);
       candidates.push({
         type: 'shear_exceed',
-        threshold: maxShearTh,
+        threshold: frictionTh,
         actual: latest.maxShearStress,
         region: this.pickRegion(task),
-        desc: '最大剪应力超过摩擦强度阈值，存在滑动触发风险',
+        desc: `最大剪应力(${latest.maxShearStress.toFixed(1)}MPa)已超过同点摩擦强度(${frictionTh.toFixed(1)}MPa)，超出${over}MPa，存在滑动触发风险`,
       });
     }
+
     const slipTh = ctx.slipRateThreshold ?? 8;
-    if (latest.slipRate > slipTh) {
+    const recentN = Math.min(monitorPts.length, 6);
+    const recentSlipVals = monitorPts.slice(-recentN).map((p) => p.slipRate);
+    const contStreak = countContinuousAbove(recentSlipVals, slipTh);
+    const ratioAbove = countAboveRatio(recentSlipVals, slipTh);
+    const slipTrigger = contStreak >= 3 || ratioAbove >= 0.6;
+    if (slipTrigger) {
+      const avg = +(recentSlipVals.reduce((a, b) => a + b, 0) / recentSlipVals.length).toFixed(2);
+      const peak = +Math.max(...recentSlipVals).toFixed(2);
       candidates.push({
         type: 'slip_anomaly',
         threshold: slipTh,
-        actual: latest.slipRate,
+        actual: peak,
         region: this.pickRegion(task),
-        desc: '滑动速率异常升高，建议复核孔隙压力',
+        desc: `最近${recentN}个监控点中${Math.round(ratioAbove * 100)}%超阈值，连续超标${contStreak}个点，峰值${peak}mm/d，均值${avg}mm/d，建议复核孔隙压力`,
       });
     }
+
     if (monitorPts.length > 5) {
       const convTh = ctx.convergenceThreshold ?? 0.001;
       const last5 = monitorPts.slice(-5);
@@ -223,13 +257,15 @@ export class AlertService {
         });
       }
     }
+
     if (candidates.length === 0) return [];
     const existingAlerts = db.getAll('alerts');
     const results: Alert[] = [];
     for (const c of candidates) {
-      if (isDuplicateAlert(existingAlerts, taskId, c.type, c.region)) continue;
+      if (isDuplicateAlert(existingAlerts, taskId, c.type)) continue;
       const alert = this.createAlert(task, c.type, c.threshold, c.actual, c.region, c.desc);
       results.push(alert);
+      existingAlerts.push(alert);
     }
     return results;
   }

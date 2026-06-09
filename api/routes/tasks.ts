@@ -38,20 +38,24 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
     page: Number(req.query.page ?? 1),
     pageSize: Number(req.query.pageSize ?? 20),
   };
-  const data: PaginatedResponse<SimulationTask> = TaskService.list(query);
-  const filteredData = data.data.filter((task) => {
-    const fault = db.getById('faults', task.faultId) as Fault | undefined;
+  let all: SimulationTask[] = db.getAll('tasks');
+  if (query.status) all = all.filter((t) => t.status === query.status);
+  if (query.faultId) all = all.filter((t) => t.faultId === query.faultId);
+  if (query.creatorId) all = all.filter((t) => t.creatorId === query.creatorId);
+  all = all.filter((t) => {
+    const fault = db.getById('faults', t.faultId) as Fault | undefined;
     return !fault?.isPaused;
   });
-  const filteredTotal = filteredData.length;
+  all.sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
+  const total = all.length;
   const page = query.page;
   const pageSize = query.pageSize;
   const start = (page - 1) * pageSize;
   const body: ApiResponse<PaginatedResponse<SimulationTask>> = {
     success: true,
     data: {
-      data: filteredData.slice(start, start + pageSize),
-      total: filteredTotal,
+      data: all.slice(start, start + pageSize),
+      total,
       page,
       pageSize,
     },
