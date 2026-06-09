@@ -7,8 +7,12 @@ import type {
   MonitorDataPoint,
   PaginatedResponse,
   User,
+  AdjustmentLog,
+  RockMechanicsParams,
+  BoundaryConditions,
 } from '../../shared/types.js';
 import { db } from '../db/store.js';
+import { TaskService } from './TaskService.js';
 
 function isoNow(): string {
   return new Date().toISOString();
@@ -96,7 +100,39 @@ export class AlertService {
     }));
     if (!updated) return undefined;
     if (params.action === 'adjust_friction' || params.action === 'adjust_pore') {
-      this.applyAdjustmentToTask(id, params.action);
+      const alert = db.getById('alerts', id);
+      if (alert) {
+        const task = db.getById('tasks', alert.taskId);
+        if (task) {
+          const oldFriction = task.rockParams.frictionCoefficient;
+          const oldPore = task.boundaryConditions.porePressure;
+          const newFriction = +(oldFriction * 1.08).toFixed(3);
+          const newPore = +(oldPore * 0.92).toFixed(2);
+
+          let paramChanges: Partial<RockMechanicsParams & BoundaryConditions>;
+          if (params.action === 'adjust_friction') {
+            paramChanges = { frictionCoefficient: newFriction };
+          } else {
+            paramChanges = { porePressure: newPore };
+          }
+
+          const log: AdjustmentLog = {
+            id: uuidv4(),
+            timestamp: isoNow(),
+            operator: reviewer.id,
+            alertId: id,
+            paramChanges,
+            reason: params.comment + '预警复核触发调整',
+          };
+
+          db.update('tasks', alert.taskId, (prev) => ({
+            ...prev,
+            adjustmentLogs: [...prev.adjustmentLogs, log],
+            updatedAt: isoNow(),
+          }));
+        }
+      }
+      this.applyAdjustmentToTask(id, params.action, reviewer, params.comment);
     }
     return db.getById('alerts', id);
   }
@@ -104,10 +140,13 @@ export class AlertService {
   private static applyAdjustmentToTask(
     alertId: string,
     action: 'adjust_friction' | 'adjust_pore',
+    reviewer: User,
+    comment: string,
   ): void {
     const alert = db.getById('alerts', alertId);
     if (!alert) return;
-    db.update('tasks', alert.taskId, (prev) => {
+    const taskId = alert.taskId;
+    db.update('tasks', taskId, (prev) => {
       const bc = { ...prev.boundaryConditions };
       const rp = { ...prev.rockParams };
       if (action === 'adjust_friction') {
@@ -117,6 +156,14 @@ export class AlertService {
       }
       return { ...prev, boundaryConditions: bc, rockParams: rp, updatedAt: isoNow() };
     });
+
+    TaskService.updateStatus(taskId, 'rollback', reviewer.id, '预警触发参数调整回退');
+    setTimeout(() => {
+      TaskService.updateStatus(taskId, 'stress_computing', 'SYSTEM', '调整参数后重新进入应力计算');
+    }, 1500);
+    setTimeout(() => {
+      TaskService.autoAdvance(taskId);
+    }, 2000);
   }
 
   static checkAndTrigger(

@@ -179,9 +179,6 @@ export class TaskService {
     }
     if (nextStatus === 'stress_computing' || nextStatus === 'slip_evaluating') {
       this.simulateTick(id);
-    }
-    const shouldAlert = Math.random() < 0.35 && nextStatus === 'stress_computing';
-    if (shouldAlert) {
       AlertService.checkAndTrigger(id);
     }
     const delay =

@@ -1,5 +1,8 @@
 import { useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import { AlertOctagon, ArrowRight, Clock, MapPin, FileText, User, Send, CheckCircle, Sliders, Droplets, ShieldAlert, History, ChevronRight, TrendingUp, AlertTriangle } from "lucide-react";
+import api from "@/lib/api";
+import useStore from "@/store";
 
 interface HistoryAlert {
   id: string;
@@ -34,8 +37,24 @@ const statusBadge = {
 };
 
 type ReviewAction = "friction" | "pressure" | "ignore" | null;
+type ApiReviewAction = "adjust_friction" | "adjust_pore" | "confirm_normal";
+
+const actionMap: Record<Exclude<ReviewAction, null>, ApiReviewAction> = {
+  friction: "adjust_friction",
+  pressure: "adjust_pore",
+  ignore: "confirm_normal",
+};
 
 export default function AlertDetailPage() {
+  const { id = "ALT-2026-0609-001" } = useParams();
+  const navigate = useNavigate();
+  const showToast = useStore((s) => s.showToast);
+
+  const alert = {
+    id,
+    taskId: "TASK-2026-0608-003",
+  };
+
   const [selectedAction, setSelectedAction] = useState<ReviewAction>(null);
   const [frictionValue, setFrictionValue] = useState(0.62);
   const [pressureValue, setPressureValue] = useState(0.35);
@@ -47,13 +66,49 @@ export default function AlertDetailPage() {
   const thresholdVal = 80.0;
   const overPct = ((actualVal - thresholdVal) / thresholdVal * 100).toFixed(1);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!selectedAction) return;
+    const apiAction = actionMap[selectedAction];
     setIsSubmitting(true);
-    setTimeout(() => {
-      setIsSubmitting(false);
+    try {
+      const payload: Record<string, unknown> = {
+        action: apiAction,
+        comment,
+      };
+      if (selectedAction === "friction") {
+        payload.frictionCoefficient = frictionValue;
+      }
+      if (selectedAction === "pressure") {
+        payload.porePressure = pressureValue;
+      }
+
+      const resp = await api.post(`/alerts/${alert.id}/review`, payload);
+      (resp as any).data?.data ?? resp.data;
+
       setSubmitted(true);
-    }, 1500);
+
+      if (apiAction === "adjust_friction" || apiAction === "adjust_pore") {
+        showToast({
+          type: "success",
+          title: "复核完成，已写入调整日志，任务重新进入应力计算阶段，3秒后跳转任务详情",
+        });
+      } else if (apiAction === "confirm_normal") {
+        showToast({
+          type: "success",
+          title: "标记为无异常，预警已归档",
+        });
+      }
+
+      setTimeout(() => {
+        navigate(`/tasks/${alert.taskId}`);
+      }, 3000);
+    } catch (error: any) {
+      showToast({
+        type: "error",
+        title: error?.message || "提交失败，请稍后重试",
+      });
+      setIsSubmitting(false);
+    }
   };
 
   if (submitted) {

@@ -1,4 +1,5 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+import { useParams } from "react-router-dom";
 import ReactECharts from "echarts-for-react";
 import {
   Download,
@@ -16,17 +17,69 @@ import {
   Hash,
   Clock,
   MapPin,
+  Loader2,
 } from "lucide-react";
-import jsPDF from "jspdf";
-import html2canvas from "html2canvas";
+import api, { get } from "@/lib/api";
+import type { SimulationReport, StressType } from "@/lib/types";
+import useStore from "@/store";
 
 export default function ReportPage() {
+  const { id } = useParams<{ id: string }>();
+  const taskId = id || "329";
+  const showToast = useStore((s) => s.showToast);
+
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [faultFilter, setFaultFilter] = useState("all");
-  const [stressFilter, setStressFilter] = useState("all");
-  const [timeRange, setTimeRange] = useState({ start: "2025-01-01", end: "2026-06-09" });
+  const [report, setReport] = useState<SimulationReport | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const [segmentIds, setSegmentIds] = useState<string[]>([]);
+  const [stressSource, setStressSource] = useState<StressType | "all">("all");
+  const [timeWindow, setTimeWindow] = useState<{ startStep: number; endStep: number }>({
+    startStep: 0,
+    endStep: 0,
+  });
+  const [exporting, setExporting] = useState(false);
+
   const reportRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    async function loadReport() {
+      try {
+        setLoading(true);
+        const data = await get<SimulationReport>(`/report/${taskId}`);
+        setReport(data);
+
+        const uniqueSegments = Array.from(
+          new Set(data.slipDistribution.map((s) => s.segmentId))
+        );
+        setSegmentIds(uniqueSegments);
+
+        if (data.seismicMomentCurve.length > 0) {
+          const steps = data.seismicMomentCurve.map((m) => m.timeStep);
+          const minStep = Math.min(...steps);
+          const maxStep = Math.max(...steps);
+          setTimeWindow({ startStep: minStep, endStep: maxStep });
+        }
+      } catch (error) {
+        console.error("加载报告失败:", error);
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadReport();
+  }, [taskId]);
+
+  const availableSegmentIds = report
+    ? Array.from(new Set(report.slipDistribution.map((s) => s.segmentId)))
+    : [];
+
+  const minTimeStep = report?.seismicMomentCurve.length
+    ? Math.min(...report.seismicMomentCurve.map((m) => m.timeStep))
+    : 0;
+  const maxTimeStep = report?.seismicMomentCurve.length
+    ? Math.max(...report.seismicMomentCurve.map((m) => m.timeStep))
+    : 11;
 
   const stressHeatmapOption = {
     title: { text: "应力场2D热力图", left: "center", textStyle: { fontSize: 14, fontWeight: "bold" } },
@@ -58,11 +111,16 @@ export default function ReportPage() {
     title: { text: "断层滑动势分布", left: "center", textStyle: { fontSize: 14, fontWeight: "bold" } },
     tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
     grid: { left: "3%", right: "4%", bottom: "3%", top: "18%", containLabel: true },
-    xAxis: { type: "category", data: ["F-01", "F-02", "F-03", "F-04", "F-05", "F-06", "F-07", "F-08", "F-09", "F-10"], axisLabel: { rotate: 30 } },
+    xAxis: { type: "category", data: availableSegmentIds.length ? availableSegmentIds : ["F-01", "F-02", "F-03", "F-04", "F-05", "F-06", "F-07", "F-08", "F-09", "F-10"], axisLabel: { rotate: 30 } },
     yAxis: { type: "value", name: "滑动势指数" },
     series: [{
       type: "bar",
-      data: [
+      data: report?.slipDistribution.map((s) => ({
+        value: s.slipPotential,
+        itemStyle: {
+          color: s.slipPotential > 0.8 ? "#ef4444" : s.slipPotential > 0.6 ? "#f97316" : s.slipPotential > 0.4 ? "#eab308" : "#22c55e",
+        },
+      })) || [
         { value: 0.85, itemStyle: { color: "#ef4444" } },
         { value: 0.72, itemStyle: { color: "#f97316" } },
         { value: 0.58, itemStyle: { color: "#eab308" } },
@@ -87,7 +145,11 @@ export default function ReportPage() {
     tooltip: { trigger: "axis" },
     legend: { data: ["累积矩释放", "瞬时释放速率"], top: "8%" },
     grid: { left: "3%", right: "4%", bottom: "3%", top: "20%", containLabel: true },
-    xAxis: { type: "category", boundaryGap: false, data: ["2025-Q1", "2025-Q2", "2025-Q3", "2025-Q4", "2026-Q1", "2026-Q2"] },
+    xAxis: {
+      type: "category",
+      boundaryGap: false,
+      data: report?.seismicMomentCurve.map((m) => `Step ${m.timeStep}`) || ["2025-Q1", "2025-Q2", "2025-Q3", "2025-Q4", "2026-Q1", "2026-Q2"],
+    },
     yAxis: [
       { type: "value", name: "累积矩(N·m)", position: "left" },
       { type: "value", name: "速率(N·m/yr)", position: "right" }
@@ -95,14 +157,14 @@ export default function ReportPage() {
     series: [
       {
         name: "累积矩释放", type: "line", smooth: true,
-        data: [1.2e17, 3.8e17, 7.5e17, 1.2e18, 1.8e18, 2.5e18],
+        data: report?.seismicMomentCurve.map((m) => m.cumulativeMoment) || [1.2e17, 3.8e17, 7.5e17, 1.2e18, 1.8e18, 2.5e18],
         areaStyle: { opacity: 0.3, color: "#6366f1" },
         lineStyle: { color: "#6366f1", width: 3 },
         itemStyle: { color: "#6366f1" }
       },
       {
         name: "瞬时释放速率", type: "line", smooth: true, yAxisIndex: 1,
-        data: [4.8e17, 1.04e18, 1.48e18, 1.8e18, 2.4e18, 2.8e18],
+        data: report?.seismicMomentCurve.map((m) => m.momentRate) || [4.8e17, 1.04e18, 1.48e18, 1.8e18, 2.4e18, 2.8e18],
         lineStyle: { color: "#ec4899", width: 3, type: "dashed" },
         itemStyle: { color: "#ec4899" }
       }
@@ -110,10 +172,10 @@ export default function ReportPage() {
   };
 
   const coulombAnimationOption = {
-    title: { text: `库仑应力演化 (T=${currentTime + 1}/12)`, left: "center", textStyle: { fontSize: 14, fontWeight: "bold" } },
+    title: { text: `库仑应力演化 (T=${currentTime + 1}/${maxTimeStep + 1})`, left: "center", textStyle: { fontSize: 14, fontWeight: "bold" } },
     tooltip: { trigger: "axis" },
     grid: { left: "3%", right: "4%", bottom: "8%", top: "15%", containLabel: true },
-    xAxis: { type: "category", data: ["F-01", "F-02", "F-03", "F-04", "F-05", "F-06", "F-07", "F-08"] },
+    xAxis: { type: "category", data: availableSegmentIds.slice(0, 8).length ? availableSegmentIds.slice(0, 8) : ["F-01", "F-02", "F-03", "F-04", "F-05", "F-06", "F-07", "F-08"] },
     yAxis: { type: "value", name: "库仑应力(bar)" },
     series: [{
       type: "bar",
@@ -138,40 +200,108 @@ export default function ReportPage() {
     { id: "F-07-S2", fault: "红河断裂带", segment: "元江段", risk: "中高", probability: 0.63, moment: "5.1e17 N·m", mag: "M6.8+", length: "25km" },
   ];
 
-  function handleExportCSV() {
-    const headers = ["断层ID", "断层名称", "分段", "风险等级", "破裂概率", "地震矩", "震级", "长度(km)"];
-    const rows = highRiskSegments.map(s => [s.id, s.fault, s.segment, s.risk, s.probability, s.moment, s.mag, s.length]);
-    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
-    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
+  function extractFilename(disposition: string | null, defaultName: string): string {
+    if (!disposition) return defaultName;
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try {
+        return decodeURIComponent(utf8Match[1]);
+      } catch {
+        // fall through
+      }
+    }
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    return match ? match[1] : defaultName;
+  }
+
+  async function downloadBlob(
+    response: { data: Blob; headers: Record<string, string> },
+    defaultFilename: string
+  ) {
+    const disposition = response.headers["content-disposition"] || null;
+    const filename = extractFilename(disposition, defaultFilename);
+    const url = URL.createObjectURL(response.data);
     const a = document.createElement("a");
-    a.href = url; a.download = `high_risk_report_${Date.now()}.csv`; a.click();
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  }
+
+  function handleGeneratePDF() {
+    const baseURL = api.defaults.baseURL || "/api";
+    window.open(`${baseURL}/report/${taskId}/pdf`, "_blank");
+  }
+
+  function toggleSegmentId(segId: string) {
+    setSegmentIds((prev) =>
+      prev.includes(segId) ? prev.filter((s) => s !== segId) : [...prev, segId]
+    );
+  }
+
+  function toggleAllSegments() {
+    if (segmentIds.length === availableSegmentIds.length) {
+      setSegmentIds([]);
+    } else {
+      setSegmentIds([...availableSegmentIds]);
+    }
+  }
+
+  async function handleExport(format: "csv" | "json") {
+    if (segmentIds.length === 0) {
+      showToast({
+        type: "warning",
+        title: "请选择断层段",
+        description: "至少需要选择一个断层段才能导出",
+      });
+      return;
+    }
+
+    try {
+      setExporting(true);
+      const response = await api.post(
+        `/report/${taskId}/export`,
+        {
+          format,
+          segmentIds,
+          stressSource,
+          timeWindow,
+        },
+        {
+          responseType: "blob",
+        }
+      );
+
+      const blob = response.data as Blob;
+      const headers = response.headers as Record<string, string>;
+      const defaultName = `report_${taskId}_${Date.now()}.${format}`;
+      await downloadBlob({ data: blob, headers }, defaultName);
+
+      showToast({
+        type: "success",
+        title: "导出成功",
+        description: `${format.toUpperCase()} 文件已开始下载`,
+      });
+    } catch (error) {
+      console.error("导出失败:", error);
+      showToast({
+        type: "error",
+        title: "导出失败",
+        description: "文件导出过程中发生错误，请稍后重试",
+      });
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function handleExportCSV() {
+    handleExport("csv");
   }
 
   function handleExportJSON() {
-    const data = {
-      exportTime: new Date().toISOString(),
-      filters: { faultFilter, stressFilter, timeRange },
-      highRiskSegments,
-      summary: { totalSegments: highRiskSegments.length, highRisk: 3, mediumRisk: 2 }
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `report_${Date.now()}.json`; a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  async function handleGeneratePDF() {
-    if (!reportRef.current) return;
-    const canvas = await html2canvas(reportRef.current, { scale: 2 });
-    const imgData = canvas.toDataURL("image/png");
-    const pdf = new jsPDF("l", "mm", "a4");
-    const imgWidth = 280;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-    pdf.addImage(imgData, "PNG", 10, 10, imgWidth, imgHeight);
-    pdf.save(`地震风险报告_${Date.now()}.pdf`);
+    handleExport("json");
   }
 
   function togglePlay() {
@@ -181,7 +311,7 @@ export default function ReportPage() {
       setPlaying(true);
       const interval = setInterval(() => {
         setCurrentTime(prev => {
-          if (prev >= 11) { clearInterval(interval); setPlaying(false); return 0; }
+          if (prev >= maxTimeStep) { clearInterval(interval); setPlaying(false); return 0; }
           return prev + 1;
         });
       }, 800);
@@ -197,6 +327,24 @@ export default function ReportPage() {
     }
   };
 
+  const stressSourceOptions: { value: StressType | "all"; label: string }[] = [
+    { value: "all", label: "全部" },
+    { value: "principal", label: "主应力 (principal)" },
+    { value: "shear", label: "剪应力 (shear)" },
+    { value: "coulomb", label: "库仑应力 (coulomb)" },
+  ];
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <Loader2 className="w-10 h-10 text-indigo-600 animate-spin" />
+          <p className="text-slate-600">正在加载报告数据...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 p-6">
       <div ref={reportRef} className="max-w-7xl mx-auto space-y-6">
@@ -206,7 +354,7 @@ export default function ReportPage() {
             <div className="flex items-center justify-between">
               <div>
                 <h1 className="text-xl font-bold text-white">地震风险模拟结果报告</h1>
-                <p className="text-indigo-100 text-sm mt-1">任务编号: SIM-2026-0609-00329</p>
+                <p className="text-indigo-100 text-sm mt-1">任务编号: SIM-2026-0609-{taskId.padStart(5, '0')}</p>
               </div>
               <span className="px-3 py-1 bg-green-500/90 text-white text-sm font-medium rounded-full">已完成</span>
             </div>
@@ -216,7 +364,7 @@ export default function ReportPage() {
               <div className="p-2 bg-indigo-100 rounded-lg"><Hash className="w-5 h-5 text-indigo-600" /></div>
               <div>
                 <div className="text-xs text-slate-500">模拟任务ID</div>
-                <div className="font-semibold text-slate-800">#329</div>
+                <div className="font-semibold text-slate-800">#{taskId}</div>
               </div>
             </div>
             <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
@@ -276,14 +424,16 @@ export default function ReportPage() {
                 <button onClick={togglePlay} className="p-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition">
                   {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                 </button>
-                <button onClick={() => setCurrentTime(11)} className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 transition"><SkipForward className="w-4 h-4" /></button>
+                <button onClick={() => setCurrentTime(maxTimeStep)} className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 transition"><SkipForward className="w-4 h-4" /></button>
               </div>
               <div className="flex-1">
-                <input type="range" min="0" max="11" value={currentTime}
+                <input type="range" min={minTimeStep} max={maxTimeStep} value={currentTime}
                   onChange={(e) => setCurrentTime(parseInt(e.target.value))}
                   className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
                 <div className="flex justify-between text-xs text-slate-500 mt-1">
-                  <span>2025-Q1</span><span>2025-Q3</span><span>2026-Q1</span><span>2026-Q2</span>
+                  <span>Step {minTimeStep}</span>
+                  <span>Step {Math.floor((minTimeStep + maxTimeStep) / 2)}</span>
+                  <span>Step {maxTimeStep}</span>
                 </div>
               </div>
             </div>
@@ -297,46 +447,141 @@ export default function ReportPage() {
               <Filter className="w-5 h-5 text-indigo-600" />
               <h2 className="font-bold text-slate-800">数据导出筛选</h2>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+
+            <div className="space-y-5 mb-4">
+              {/* 断层段多选 checkbox */}
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">断层段筛选</label>
-                <select value={faultFilter} onChange={(e) => setFaultFilter(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
-                  <option value="all">全部断层段</option>
-                  <option value="longmenshan">龙门山断裂带</option>
-                  <option value="xianshuihe">鲜水河断裂带</option>
-                  <option value="anninghe">安宁河断裂带</option>
-                  <option value="xiaojiang">小江断裂带</option>
-                </select>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-slate-700">
+                    断层段筛选 <span className="text-xs text-slate-500">（已选 {segmentIds.length}/{availableSegmentIds.length}）</span>
+                  </label>
+                  <button
+                    onClick={toggleAllSegments}
+                    className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
+                  >
+                    {segmentIds.length === availableSegmentIds.length ? "取消全选" : "全选"}
+                  </button>
+                </div>
+                <div className="border border-slate-200 rounded-lg p-3 max-h-36 overflow-y-auto bg-slate-50">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                    {availableSegmentIds.map((segId) => (
+                      <label
+                        key={segId}
+                        className="flex items-center gap-2 p-2 rounded hover:bg-white cursor-pointer transition"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={segmentIds.includes(segId)}
+                          onChange={() => toggleSegmentId(segId)}
+                          className="w-4 h-4 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500"
+                        />
+                        <span className="text-sm text-slate-700 font-mono">{segId}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
               </div>
+
+              {/* 应力源 Radio */}
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">应力源</label>
-                <select value={stressFilter} onChange={(e) => setStressFilter(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
-                  <option value="all">全部应力源</option>
-                  <option value="tectonic">构造应力</option>
-                  <option value="coulomb">库仑应力触发</option>
-                  <option value="pore">孔隙压力</option>
-                </select>
+                <label className="block text-sm font-medium text-slate-700 mb-2">应力源</label>
+                <div className="flex flex-wrap gap-3">
+                  {stressSourceOptions.map((opt) => (
+                    <label
+                      key={opt.value}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-lg border cursor-pointer transition ${
+                        stressSource === opt.value
+                          ? "bg-indigo-50 border-indigo-500 text-indigo-700"
+                          : "bg-white border-slate-200 text-slate-700 hover:border-slate-300"
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="stressSource"
+                        value={opt.value}
+                        checked={stressSource === opt.value}
+                        onChange={() => setStressSource(opt.value)}
+                        className="w-4 h-4 text-indigo-600 border-slate-300 focus:ring-indigo-500"
+                      />
+                      <span className="text-sm font-medium">{opt.label}</span>
+                    </label>
+                  ))}
+                </div>
               </div>
-              <div className="space-y-1">
-                <label className="block text-sm font-medium text-slate-700 mb-1">时间窗口</label>
-                <div className="flex gap-2">
-                  <input type="date" value={timeRange.start} onChange={(e) => setTimeRange({ ...timeRange, start: e.target.value })}
-                    className="flex-1 px-2 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm" />
-                  <input type="date" value={timeRange.end} onChange={(e) => setTimeRange({ ...timeRange, end: e.target.value })}
-                    className="flex-1 px-2 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm" />
+
+              {/* 时间窗口 双数字输入框 */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  时间窗口（Time Step 范围：{minTimeStep} ~ {maxTimeStep}）
+                </label>
+                <div className="flex items-center gap-3">
+                  <div className="flex-1">
+                    <div className="text-xs text-slate-500 mb-1">起始 Step</div>
+                    <input
+                      type="number"
+                      min={minTimeStep}
+                      max={timeWindow.endStep}
+                      value={timeWindow.startStep}
+                      onChange={(e) =>
+                        setTimeWindow({
+                          ...timeWindow,
+                          startStep: Math.max(
+                            minTimeStep,
+                            Math.min(timeWindow.endStep, parseInt(e.target.value) || minTimeStep)
+                          ),
+                        })
+                      }
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                  <div className="text-slate-400 pt-5">—</div>
+                  <div className="flex-1">
+                    <div className="text-xs text-slate-500 mb-1">结束 Step</div>
+                    <input
+                      type="number"
+                      min={timeWindow.startStep}
+                      max={maxTimeStep}
+                      value={timeWindow.endStep}
+                      onChange={(e) =>
+                        setTimeWindow({
+                          ...timeWindow,
+                          endStep: Math.min(
+                            maxTimeStep,
+                            Math.max(timeWindow.startStep, parseInt(e.target.value) || maxTimeStep)
+                          ),
+                        })
+                      }
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
+
             <div className="flex flex-wrap gap-3 pt-2">
-              <button onClick={handleExportCSV}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition font-medium">
-                <FileSpreadsheet className="w-4 h-4" />导出 CSV
+              <button
+                onClick={handleExportCSV}
+                disabled={exporting}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {exporting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <FileSpreadsheet className="w-4 h-4" />
+                )}
+                导出 CSV
               </button>
-              <button onClick={handleExportJSON}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
-                <FileJson className="w-4 h-4" />导出 JSON
+              <button
+                onClick={handleExportJSON}
+                disabled={exporting}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {exporting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <FileJson className="w-4 h-4" />
+                )}
+                导出 JSON
               </button>
             </div>
           </div>

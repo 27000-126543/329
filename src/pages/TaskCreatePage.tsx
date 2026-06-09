@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
@@ -18,20 +18,9 @@ import {
   Clock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import api from "@/lib/api";
+import type { Fault } from "@/lib/types";
 import useStore from "@/store";
-
-const faultOptions = [
-  { code: "SAF", name: "圣安德烈斯断层", segments: 24, default: true },
-  { code: "HY", name: "海原断裂带", segments: 18 },
-  { code: "LMS", name: "龙门山断裂带", segments: 15 },
-  { code: "XSH", name: "鲜水河断裂带", segments: 12 },
-  { code: "TL", name: "郯庐断裂带", segments: 32 },
-  { code: "HH", name: "红河断裂带", segments: 22 },
-  { code: "QLS", name: "祁连山北缘断裂", segments: 14 },
-  { code: "XJ", name: "小江断裂带", segments: 18 },
-  { code: "ANH", name: "安宁河断裂带", segments: 11 },
-  { code: "CD", name: "则木河断裂带", segments: 8 },
-];
 
 const modelTemplates = [
   {
@@ -75,13 +64,35 @@ const priorityOptions = [
 export default function TaskCreatePage() {
   const navigate = useNavigate();
   const currentUser = useStore((s) => s.currentUser);
+  const showToast = useStore((s) => s.showToast);
   const user = currentUser ? { ...currentUser, displayName: currentUser.name } : null;
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
+  const [faults, setFaults] = useState<Fault[]>([]);
+  const [faultsLoading, setFaultsLoading] = useState(true);
+
+  useEffect(() => {
+    const loadFaults = async () => {
+      setFaultsLoading(true);
+      try {
+        const resp = await api.get<Fault[]>('/faults');
+        const data = (resp as any).data?.data ?? resp.data ?? resp;
+        setFaults(Array.isArray(data) ? data : []);
+      } catch (e) {
+        console.error(e);
+        showToast({ type: 'error', title: '加载断层列表失败' });
+      } finally {
+        setFaultsLoading(false);
+      }
+    };
+    loadFaults();
+  }, [showToast]);
+
+  const firstAvailableFault = faults.find((f) => !f.isPaused);
 
   const [form, setForm] = useState({
     name: "",
-    faultCode: "SAF",
+    faultId: "",
     templateId: "standard",
     priority: "normal",
     steps: 8400,
@@ -95,7 +106,13 @@ export default function TaskCreatePage() {
     description: "",
   });
 
-  const selectedFault = faultOptions.find((f) => f.code === form.faultCode)!;
+  useEffect(() => {
+    if (!form.faultId && firstAvailableFault) {
+      setForm((prev) => ({ ...prev, faultId: firstAvailableFault.id }));
+    }
+  }, [firstAvailableFault, form.faultId]);
+
+  const selectedFault = faults.find((f) => f.id === form.faultId);
   const selectedTemplate = modelTemplates.find((t) => t.id === form.templateId)!;
 
   const update = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => {
@@ -118,20 +135,45 @@ export default function TaskCreatePage() {
   const estimatedHours = (form.steps / 8400) * (500 / form.resolution) * 6.5;
   const estimatedGpu = Math.ceil((form.steps * form.resolution) / 500000);
 
-  const canNext = step === 1 ? form.name.trim().length >= 4 : true;
+  const canNext = step === 1 ? form.name.trim().length >= 4 && !!form.faultId : true;
 
   const handleSubmit = async (startNow: boolean) => {
+    const targetFault = faults.find((f) => f.id === form.faultId);
+    if (targetFault?.isPaused) {
+      showToast({
+        type: 'error',
+        title: '提交失败',
+        description: `断层「${targetFault.name}」已暂停(偏差超20%)，请选择其他断层`,
+      });
+      return;
+    }
+
     setSubmitting(true);
-    await new Promise((r) => setTimeout(r, 1200));
-    setSubmitting(false);
-    navigate("/tasks", {
-      state: {
-        toast: {
-          type: "success",
-          message: startNow ? "任务已提交并开始执行" : "任务已保存至队列",
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+      const successMsg = startNow ? "任务已提交并开始执行" : "任务已保存至队列";
+      showToast({
+        type: 'success',
+        title: '提交成功',
+        description: successMsg,
+      });
+      navigate("/tasks", {
+        state: {
+          toast: {
+            type: "success",
+            message: successMsg,
+          },
         },
-      },
-    });
+      });
+    } catch (e) {
+      showToast({
+        type: 'error',
+        title: '提交失败',
+        description: '请稍后重试',
+      });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -285,40 +327,63 @@ export default function TaskCreatePage() {
                   <div className="flex items-center gap-2">
                     <Mountain className="w-5 h-5 text-emerald-500" />
                     <h2 className="font-semibold text-slate-800">选择目标断层</h2>
+                    {faultsLoading && (
+                      <div className="w-4 h-4 border-2 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin ml-2" />
+                    )}
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
-                    {faultOptions.map((f) => (
-                      <button
-                        key={f.code}
-                        onClick={() => update("faultCode", f.code)}
-                        className={cn(
-                          "p-4 rounded-xl border-2 text-left transition-all hover:-translate-y-0.5",
-                          form.faultCode === f.code
-                            ? "border-indigo-500 bg-indigo-50/60 shadow-md"
-                            : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
-                        )}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span
+                    {faultsLoading
+                      ? Array.from({ length: 5 }).map((_, i) => (
+                          <div
+                            key={i}
+                            className="p-4 rounded-xl border-2 border-slate-200 bg-white animate-pulse"
+                          >
+                            <div className="h-4 bg-slate-200 rounded w-10 mb-3" />
+                            <div className="h-4 bg-slate-200 rounded w-3/4 mb-2" />
+                            <div className="h-3 bg-slate-100 rounded w-1/2" />
+                          </div>
+                        ))
+                      : faults.map((f) => (
+                          <button
+                            key={f.id}
+                            onClick={() => !f.isPaused && update("faultId", f.id)}
+                            disabled={f.isPaused}
                             className={cn(
-                              "px-1.5 py-0.5 rounded text-[10px] font-mono font-bold",
-                              form.faultCode === f.code
-                                ? "bg-indigo-500 text-white"
-                                : "bg-slate-100 text-slate-600"
+                              "p-4 rounded-xl border-2 text-left transition-all relative",
+                              f.isPaused
+                                ? "border-slate-200 bg-slate-50 opacity-70 cursor-not-allowed"
+                                : cn(
+                                    "hover:-translate-y-0.5",
+                                    form.faultId === f.id
+                                      ? "border-indigo-500 bg-indigo-50/60 shadow-md"
+                                      : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
+                                  )
                             )}
                           >
-                            {f.code}
-                          </span>
-                          {f.default && (
-                            <span className="text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
-                              常用
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-sm font-semibold text-slate-800 mb-1">{f.name}</div>
-                        <div className="text-[11px] text-slate-500">{f.segments} 个分段</div>
-                      </button>
-                    ))}
+                            {f.isPaused && (
+                              <div className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 text-[10px] font-semibold border border-rose-200">
+                                <AlertCircle className="w-3 h-3" />
+                                已暂停(偏差超20%)
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between mb-2">
+                              <span
+                                className={cn(
+                                  "px-1.5 py-0.5 rounded text-[10px] font-mono font-bold",
+                                  !f.isPaused && form.faultId === f.id
+                                    ? "bg-indigo-500 text-white"
+                                    : "bg-slate-100 text-slate-600"
+                                )}
+                              >
+                                {f.id.slice(0, 3).toUpperCase()}
+                              </span>
+                            </div>
+                            <div className="text-sm font-semibold text-slate-800 mb-1 pr-16">{f.name}</div>
+                            <div className="text-[11px] text-slate-500">
+                              {f.lengthKm} km · 走向 {f.strike}° · 倾角 {f.dip}°
+                            </div>
+                          </button>
+                        ))}
                   </div>
                 </section>
               </div>
@@ -542,7 +607,7 @@ export default function TaskCreatePage() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
                     {[
                       { label: "任务名称", value: form.name || "（未填写）", warn: !form.name },
-                      { label: "目标断层", value: `${selectedFault.name} (${selectedFault.code})` },
+                      { label: "目标断层", value: selectedFault ? `${selectedFault.name} (${selectedFault.id.slice(0, 3).toUpperCase()})` : "（未选择）", warn: !selectedFault },
                       { label: "优先级", value: priorityOptions.find((p) => p.value === form.priority)?.label || "-" },
                       { label: "计算模型", value: selectedTemplate.name },
                       { label: "模拟步数", value: `${form.steps.toLocaleString()} 步`, unit: "" },
@@ -642,10 +707,10 @@ export default function TaskCreatePage() {
               <div className="flex items-center gap-3">
                 <button
                   onClick={() => handleSubmit(false)}
-                  disabled={submitting || !form.name}
+                  disabled={submitting || !form.name || !form.faultId}
                   className={cn(
                     "px-6 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center gap-2",
-                    !form.name || submitting
+                    !form.name || !form.faultId || submitting
                       ? "bg-slate-200 text-slate-400 cursor-not-allowed"
                       : "bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 hover:border-slate-400"
                   )}
@@ -655,10 +720,10 @@ export default function TaskCreatePage() {
                 </button>
                 <button
                   onClick={() => handleSubmit(true)}
-                  disabled={submitting || !form.name}
+                  disabled={submitting || !form.name || !form.faultId}
                   className={cn(
                     "px-8 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center gap-2 shadow-md",
-                    !form.name || submitting
+                    !form.name || !form.faultId || submitting
                       ? "bg-slate-200 text-slate-400 cursor-not-allowed"
                       : "bg-gradient-to-r from-emerald-500 to-teal-600 text-white hover:shadow-lg hover:-translate-y-0.5"
                   )}
